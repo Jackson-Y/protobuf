@@ -78,6 +78,20 @@ static NSString *const kGPBDataCoderKey = @"GPBData";
   GPBMessage *autocreator_;
   GPBFieldDescriptor *autocreatorField_;
   GPBExtensionDescriptor *autocreatorExtension_;
+
+  // A lock to provide mutual exclusion from internal data that can be modified
+  // by *read* operations such as getters (autocreation of message fields and
+  // message extensions, not setting of values). Used to guarantee thread safety
+  // for concurrent reads on the message.
+  // NOTE: OSSpinLock may seem like a good fit here but Apple engineers have
+  // pointed out that they are vulnerable to live locking on iOS in cases of
+  // priority inversion:
+  //   http://mjtsai.com/blog/2015/12/16/osspinlock-is-unsafe/
+  //   https://lists.swift.org/pipermail/swift-dev/Week-of-Mon-20151214/000372.html
+  // Use of readOnlySemaphore_ must be prefaced by a call to
+  // GPBPrepareReadOnlySemaphore to ensure it has been created. This allows
+  // readOnlySemaphore_ to be only created when actually needed.
+  _Atomic(dispatch_semaphore_t) readOnlySemaphore_;
 }
 @end
 
@@ -753,6 +767,12 @@ void GPBPrepareReadOnlySemaphore(GPBMessage *self) {
     if (!atomic_compare_exchange_strong(&self->readOnlySemaphore_, &expected, worker)) {
       dispatch_release(worker);
     }
+#if defined(__clang_analyzer__)
+    // The Xcode 9.2 (and 9.3 beta) static analyzer thinks worker is leaked
+    // (doesn't seem to know about atomic_compare_exchange_strong); so just
+    // for the analyzer, let it think worker is also released in this case.
+    else { dispatch_release(worker); }
+#endif
   }
 
 #pragma clang diagnostic pop
@@ -3064,6 +3084,14 @@ static void ResolveIvarSet(__unsafe_unretained GPBFieldDescriptor *field,
       result->encodingSelector = @selector(set##NAME:);                       \
       break;                                                                  \
     }
+#define CASE_SET_COPY(NAME)                                                   \
+    case GPBDataType##NAME: {                                                 \
+      result->impToAdd = imp_implementationWithBlock(^(id obj, id value) {    \
+        return GPBSetRetainedObjectIvarWithFieldInternal(obj, field, [value copy], syntax); \
+      });                                                                     \
+      result->encodingSelector = @selector(set##NAME:);                       \
+      break;                                                                  \
+    }
       CASE_SET(Bool, BOOL, Bool)
       CASE_SET(Fixed32, uint32_t, UInt32)
       CASE_SET(SFixed32, int32_t, Int32)
@@ -3077,8 +3105,8 @@ static void ResolveIvarSet(__unsafe_unretained GPBFieldDescriptor *field,
       CASE_SET(SInt64, int64_t, Int64)
       CASE_SET(UInt32, uint32_t, UInt32)
       CASE_SET(UInt64, uint64_t, UInt64)
-      CASE_SET(Bytes, id, Object)
-      CASE_SET(String, id, Object)
+      CASE_SET_COPY(Bytes)
+      CASE_SET_COPY(String)
       CASE_SET(Message, id, Object)
       CASE_SET(Group, id, Object)
       CASE_SET(Enum, int32_t, Enum)
@@ -3158,7 +3186,7 @@ static void ResolveIvarSet(__unsafe_unretained GPBFieldDescriptor *field,
         // full lookup.
         const GPBFileSyntax syntax = descriptor.file.syntax;
         result.impToAdd = imp_implementationWithBlock(^(id obj, id value) {
-          return GPBSetObjectIvarWithFieldInternal(obj, field, value, syntax);
+          GPBSetObjectIvarWithFieldInternal(obj, field, value, syntax);
         });
         result.encodingSelector = @selector(setArray:);
         break;
@@ -3264,6 +3292,34 @@ id GPBGetMessageMapField(GPBMessage *self, GPBFieldDescriptor *field) {
   GPBDescriptor *descriptor = [[self class] descriptor];
   GPBFileSyntax syntax = descriptor.file.syntax;
   return GetOrCreateMapIvarWithField(self, field, syntax);
+}
+
+id GPBGetObjectIvarWithField(GPBMessage *self, GPBFieldDescriptor *field) {
+  NSCAssert(!GPBFieldIsMapOrArray(field), @"Shouldn't get here");
+  if (GPBGetHasIvarField(self, field)) {
+    uint8_t *storage = (uint8_t *)self->messageStorage_;
+    id *typePtr = (id *)&storage[field->description_->offset];
+    return *typePtr;
+  }
+  // Not set...
+
+  // Non messages (string/data), get their default.
+  if (!GPBFieldDataTypeIsMessage(field)) {
+    return field.defaultValue.valueMessage;
+  }
+
+  GPBPrepareReadOnlySemaphore(self);
+  dispatch_semaphore_wait(self->readOnlySemaphore_, DISPATCH_TIME_FOREVER);
+  GPBMessage *result = GPBGetObjectIvarWithFieldNoAutocreate(self, field);
+  if (!result) {
+    // For non repeated messages, create the object, set it and return it.
+    // This object will not initially be visible via GPBGetHasIvar, so
+    // we save its creator so it can become visible if it's mutated later.
+    result = GPBCreateMessageWithAutocreator(field.msgClass, self, field);
+    GPBSetAutocreatedRetainedObjectIvarWithField(self, field, result);
+  }
+  dispatch_semaphore_signal(self->readOnlySemaphore_);
+  return result;
 }
 
 #pragma clang diagnostic pop
